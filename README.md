@@ -2,6 +2,8 @@
 Incident Image Explorer
 
 Video tutorial: https://www.youtube.com/watch?v=_9KLKAh2334 
+
+Stand alone version for Windows: https://tinyurl.com/imexapplication (on OneDrive)
 ## Goal of Imex 
 
 Incident Image Explorer (Imex) is an application for exploring large image collections in order to gain insight. Imex helps with efficiently structuring an image collection into user defined categories, by generating clusters of images based on the similarity of the images. This allows you to quickly browse through a semi-structured image collection. You can then use your expert knowledge to explore and search through the image collection, and structure the images as you want. 
