@@ -1152,7 +1152,6 @@ class Application(Frame,object):
         self.c.bind("<Button-3>", rank_images)
         
         self.num_im_row = math.floor(self.screen_width / (self.imsize + self.image_distance)) #the total number of images that fit from left to right
-        print("WHATTTTT")
 
         if self.nonR.var.get() == 1 and self.bucketDisp is not 1:
             nonrelevants = self.theBuckets['Non-RelevantItems']
@@ -2597,25 +2596,12 @@ class Application(Frame,object):
                             transforms.Normalize(mean, std)
                         ])
             def get_vector(image_name,f_size, layer, transform, model, neural_net):
-                img = Image.open(image_name)                
-#                try:
-#                    for orientation in ExifTags.TAGS.keys():
-#                        if ExifTags.TAGS[orientation]=='Orientation':
-#                            break
-#                    exif=dict(img._getexif().items())
-#                    print(image_name)
-#                    if exif[orientation] == 3:
-#                        print(image_name)
-#                        img=img.rotate(180, expand=True)
-#                    elif exif[orientation] == 6:
-#                        img=img.rotate(270, expand=True)
-#                    elif exif[orientation] == 8:
-#                        img=img.rotate(90, expand=True)                
-#                except AttributeError:
-#                    pass
-#                except KeyError:
-#                    pass
-
+                try:
+                    img = Image.open(image_name)                
+                except OSError:
+                    #if an image fails to open, a black replacement image is created...
+                    img = Image.new('RGB',(100,100))
+                
                 if img.mode == 'RGB':
                     try:
                         t_img = transform(img).unsqueeze(0)
@@ -3065,18 +3051,17 @@ class Application(Frame,object):
         self.tsne = plt.figure(figsize=(self.screen_width/100/2,self.screen_height/100), dpi=100,facecolor='#555555' )
 
         self.tsne_plot = self.tsne.add_axes([0,0,1,1], facecolor='#FFFFFF',frameon=False)
-        in_bucket = []
-        not_in_bucket = []
-        for jt in range(0,len(self.im_list)):
-            if jt in [xx for vv in self.theBuckets.values() for xx in vv]:
-                in_bucket.append(jt)
-            else:
-                not_in_bucket.append(jt)
-
-
-
-
-        
+#        in_bucket = []
+#        not_in_bucket = []
+#        for jt in range(0,len(self.im_list)):
+#            if jt in [xx for vv in self.theBuckets.values() for xx in vv]:
+#                in_bucket.append(jt)
+#            else:
+#                not_in_bucket.append(jt)
+        t = list(chain.from_iterable(self.theBuckets.values()))
+        xx = list(np.arange(0,len(self.im_list)))
+        not_in_bucket = list(sorted(set(np.arange(0,len(self.im_list))) - set(t), key=xx.index))
+        in_bucket = t
             
         self.tsne_plot.scatter(self.X_embed[not_in_bucket,0],self.X_embed[ not_in_bucket,1],c='black')
         self.tsne_plot.scatter(self.X_embed[in_bucket,0],self.X_embed[in_bucket,1],c='#00EEEE')
