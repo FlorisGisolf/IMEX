@@ -6,18 +6,20 @@ Created on Wed May 16 13:20:32 2018
 """
 import shutil
 from tkinter import *
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ExifTags, ImageFile
 import pandas as pd
 import numpy as np
 #from tkintertable import TableCanvas
 import math
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+import matplotlib as mpl
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg#, NavigationToolbar2TkAgg
 #import networkx as nx
 import pickle
 from tkinter import ttk, filedialog
 import os
+import io
 import string
 import random
 import glob
@@ -31,10 +33,17 @@ import webbrowser
 from PIL.ExifTags import TAGS, GPSTAGS
 from itertools import chain
 import torch.utils.data as data
-
-
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+from sklearn.neighbors import typedefs
+from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
+import sklearn.utils._cython_blas
+import sklearn.neighbors.quad_tree
+import sklearn.tree
+import sklearn.tree._utils
+#from sklearn.decomposition import PCA
 #for graphs
-import matplotlib
+#import matplotlib
 from collections import defaultdict
 import seaborn as sns
 
@@ -84,6 +93,11 @@ class Application(Frame,object):
         self.focusclick = 0         #keeps track of creating the square on a focused image
         self.rectanglewidth = 3     #width of the red selection rectangles
         self.neuralnet = 'resnet152'#determines the neural network used.
+        self.subcyes = 0            # is 1 when subclustering, 0 otherwise
+        self.tsneclick = 0          #keeps track of creating the square on tsne graph
+        self.X_embed = []         # variable for TSNE embedding
+        self.wt = 0
+        self.selectedcat = []       #needed to make it possible to deselect item in category box
         #currently available:
             #'resnet18'
             #'resnet152' << prefered option
@@ -307,6 +321,15 @@ class Application(Frame,object):
         self.bx['command'] = self.showImg
         self.bx.place(x=200,y=270)
         self.bx['width'] = 30
+
+        self.bshow = ttk.Button(command = lambda:[self.showCluster(),self.showImg()])
+        self.bshow['text'] ="Show cluster"  
+        self.bshow.bind('<Button-3>',showimg_text)        
+        self.bshow.place(x=970,y=230)
+        self.bshow['width'] = 15
+        
+
+
         
         #button to add current cluster to category bucket        
         self.currentcluster = []
@@ -331,6 +354,12 @@ class Application(Frame,object):
         self.bDel.place(x=1140,y=270)
         self.bDel['width'] = 33
         
+        self.ecluster = Entry(background='#777777',foreground = 'white',exportselection=0)
+        self.ecluster.insert(END, 0) #0 is default, change if needed. 
+        self.ecluster.bind('<Button-3>',numim_text)        
+        self.ecluster.place(x=900,y=230)    
+        self.ecluster['width'] = 10
+
         #enter number of images shown
         self.e1 = Entry(background='#777777',foreground = 'white',exportselection=0)
         self.e1.insert(END, 20) #20 is default, change if needed. 
@@ -348,6 +377,23 @@ class Application(Frame,object):
         self.rank_im_button['command'] = self.rank_image
         self.rank_im_button.place(x=900,y=20)
         self.rank_im_button['width'] = 30
+
+        #button to subcluster images
+        self.subc = ttk.Button()
+        self.subc['text'] ="Subcluster"
+        self.subc.bind('<Button-3>',rank_text)        
+        self.subc['command'] = self.subcluster
+        self.subc.place(x=800,y=20)
+        self.subc['width'] = 15
+
+        #button to super rank images
+        self.subc = ttk.Button()
+        self.subc['text'] ="Super rank"
+        self.subc.bind('<Button-3>',rank_text)        
+        self.subc['command'] = self.rank_bucket
+        self.subc.place(x=800,y=50)
+        self.subc['width'] = 15
+
 
 
         #button to calculate cluster overview
@@ -390,6 +436,16 @@ class Application(Frame,object):
         self.qrmask.place(x=900,y=170)
         self.qrmask['width'] = 30
 
+
+        #button to focus on an image
+        self.external = ttk.Button()
+        self.external['text'] ="Query external image"
+        self.external.bind('<Button-3>',query_text)        
+        self.external['command'] = self.query_external
+        self.external.place(x=900,y=200)
+        self.external['width'] = 30
+
+
         #button to save
         self.sb = ttk.Button()
         self.sb['text'] ="Save session as"
@@ -399,12 +455,12 @@ class Application(Frame,object):
         self.sb['width'] = 30
 
 #        #button to preload all images
-#        self.preloadbutton = ttk.Button()
-#        self.preloadbutton['text'] ="Preload images"
-#        self.preloadbutton['command'] = self.preload
-#        self.preloadbutton.bind('<Button-3>',preload_text)        
-#        self.preloadbutton.place(x=200,y=170)
-#        self.preloadbutton['width'] = 30
+        self.preloadbutton = ttk.Button()
+        self.preloadbutton['text'] ="Preload images"
+        self.preloadbutton['command'] = self.preload2
+        self.preloadbutton.bind('<Button-3>',preload_text)        
+        self.preloadbutton.place(x=200,y=170)
+        self.preloadbutton['width'] = 30
 
         #button to expand current cluster
         self.expand_c = ttk.Button()
@@ -455,7 +511,7 @@ class Application(Frame,object):
         #place of the scrollbar
         boxscrollbar.config(command=self.categories.yview)
         boxscrollbar.place(in_=self.categories,relx=1.0, relheight=1)
-
+        self.categories.bind('<Button-1>', self.deselect_list )
         
         #filter the self.categories listbox
         self.search_var = StringVar()
@@ -548,6 +604,13 @@ class Application(Frame,object):
         self.sankey_button.bind('<Button-3>',sankey_text)        
         self.sankey_button.place(x=125,y=250)
         self.sankey_button['width'] = 30
+
+        self.tsne_button = ttk.Button(self.newWindow)
+        self.tsne_button['text'] ="Create tsne graph"
+        self.tsne_button['command'] = self.create_tsne
+        self.tsne_button.bind('<Button-3>',sankey_text)        
+        self.tsne_button.place(x=400,y=250)
+        self.tsne_button['width'] = 30
 
 #        self.graph_button = ttk.Button(self.newWindow)
 #        self.graph_button['text'] ="Create graph"
@@ -802,41 +865,6 @@ class Application(Frame,object):
             im_tag = int(float(im_tag[0]))
             mijn_plaatje = self.im_list[im_tag]
             webbrowser.open(mijn_plaatje)
-            #function to open images in the default image viewer of the operating system by double clicking an image
-            
-
-                
-        #some other ways to open an image in a new tkinter window.
-#        def open_image(event):
-#            evex = self.c.canvasx(event.x)
-#            evey = self.c.canvasy(event.y)
-#
-#            self.image_window = Toplevel(self.master)
-#            self.image_window.title("image")
-#            
-#            
-#            ########
-#            
-#            x_num = math.ceil((evex)/103)-1
-#            y_num = math.ceil((evey)/103)
-#            im_num = x_num + 12*(y_num-1)
-#            im_tag = self.c.gettags(self.imagex[im_num])
-#            im_tag = int(float(im_tag[0]))
-#            mijn_plaatje = self.im_list[im_tag]
-#            x = []
-#            x.append(mijn_plaatje)
-#            load = Image.open(x[0])
-#            [xsize,ysize] = load.size
-#            self.canvas2 = Canvas(self.image_window,bg='black',bd=0,  width = ysize,height = xsize)
-#            self.canvas2.place(x=0,y=0)
-#
-#            render = ImageTk.PhotoImage(load)
-#                # labels can be text or images
-#            my_img = Label(self,background='#555555')#, image=render)
-#            my_img.image = render
-#                    #my_img.grid()
-#            self.canvas2.create_image(xsize/2,ysize/2,image = render)
-#            self.image_window.geometry('%dx%d+%d+%d' % (xsize, ysize, 400, 300))
 #
         self.c.bind('<Double-Button-1>', open_image3)
 
@@ -914,6 +942,18 @@ class Application(Frame,object):
                 
         self.c.bind("<Control-Button-1>", ctrl_click_select)
 
+#        def tsne_click(event):
+#            self.evex_tsne2 = self.canvas_tsne.canvasx(event.x)
+#            self.evey_tsne2 = self.canvas_tsne.canvasy(event.y)
+#            self.focusclick = 0
+#            if self.tsne_squares is not None:
+#                self.canvas_tsne.delete(self.tsne_squares)
+#                self.tsne_squares = self.canvas_tsne.create_rectangle(self.evex_tsne1, self.evey_tsne1, self.evex_tsne2, self.evey_tsne2)                    
+#            else:
+#                self.evex_tsne1 = self.canvas_tsne.canvasx(event.x)
+#                self.evey_tsne1 = self.canvas_tsne.canvasy(event.y)
+#            print('HELLO')
+            
 
         
         #this function ranks a selected image by rightclicking an image. It will sort all images based on correlation
@@ -951,6 +991,14 @@ class Application(Frame,object):
         self.c.bind("<Button-3>", rank_images)
 
 
+    def deselect_list(self, event):
+        if len(self.selectedcat) == 0:
+            self.selectedcat = self.categories.curselection()
+        if len(self.selectedcat) == 1:
+            if self.categories.curselection() == self.selectedcat:
+                self.categories.selection_clear(0,END)
+                self.selectedcat = []        
+        
     def _bound_to_mousewheel(self,event):
             self.c.bind_all("<MouseWheel>", self._on_mousewheel)
             
@@ -969,13 +1017,166 @@ class Application(Frame,object):
     #the function that is called by other functions in order to display images
     def display_images(self, cluster): #x is the list with the image names, cluster is the list with ids. 
         self.ccluster = cluster
+
+
+#        self.c.destroy()
+#        yscrollbar = Scrollbar(width = 16) #scroll  bar for canvas
+#        self.c = Canvas(bg='#666666',bd=0, scrollregion=(0, 0, 0, 500), yscrollcommand=yscrollbar.set, width =self.screen_width, height =self.screen_height) #canvas size
+#        self.c.place(x = 0, y=300)
+#        yscrollbar.config(command=self.c.yview)
+#        yscrollbar.place(in_=self.c,relx=1.0, relheight=1)
+#        self.c.bind('<Enter>', self._bound_to_mousewheel)
+#        self.c.bind('<Leave>', self._unbound_to_mousewheel)
+
+
+
+        def open_image3(event):
+            evex = self.c.canvasx(event.x)
+            evey = self.c.canvasy(event.y)
+            x_num = math.ceil((evex)/(self.imsize + self.image_distance))-1
+            y_num = math.ceil((evey)/(self.imsize + self.image_distance))
+            im_num = x_num + self.num_im_row*(y_num-1)
+            im_tag = self.c.gettags(self.imagex[im_num])
+            im_tag = int(float(im_tag[0]))
+            mijn_plaatje = self.im_list[im_tag]
+            webbrowser.open(mijn_plaatje)
+#
+        self.c.bind('<Double-Button-1>', open_image3)
+
+        #function to select an image and display a red square around the selected image
+        def click_select(event):
+            if self.bucketDisp == 5: #in focusview (bucketDisp=5), this function allows you to draw a square
+                self.focusclick = self.focusclick + 1
+                if self.focusclick == 2:
+                    self.evex2 = self.c.canvasx(event.x)
+                    self.evey2 = self.c.canvasy(event.y)
+                    self.focusclick = 0
+                    if self.squares is not None:
+                        self.c.delete(self.squares)
+                    self.squares = self.c.create_rectangle(self.evex1, self.evey1, self.evex2, self.evey2)                    
+                else:
+                    self.evex1 = self.c.canvasx(event.x)
+                    self.evey1 = self.c.canvasy(event.y)
+            else: #if not in focusview, this function allows you to select images and draws a red square around the selected image
+                for q in range(0,len(self.rectangles)):
+                    self.c.delete(self.rectangles[q])
+                evex = self.c.canvasx(event.x)
+                evey = self.c.canvasy(event.y)
+                x_num = math.ceil((evex)/(self.imsize + self.image_distance))-1
+                y_num = math.ceil((evey)/(self.imsize + self.image_distance))
+                self.im_numX = x_num + self.num_im_row*(y_num-1) 
+                self.selected_images = []
+                self.rectangles = []
+                self.selected_images.append(self.im_numX)
+                row_ = math.floor(self.im_numX/self.num_im_row)
+                column_ = self.im_numX%self.num_im_row
+                if len(self.imagex) >= self.im_numX+1:
+                    self.rectangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='red',width=self.rectanglewidth,tags = self.im_numX))                
+        self.c.bind("<Button-1>", click_select)
+        
+        #this allows you to select multiple adjacent images using the shift key + mouse button 1
+        def shift_click_select(event):
+            evex = self.c.canvasx(event.x)
+            evey = self.c.canvasy(event.y)
+            x_num = math.ceil((evex)/(self.imsize + self.image_distance))-1
+            y_num = math.ceil((evey)/(self.imsize + self.image_distance))
+            self.im_numY = x_num + self.num_im_row*(y_num-1)
+
+            for q in range(0,len(self.rectangles)):
+                self.c.delete(self.rectangles[q])
+            self.rectangles = []
+            self.selected_images = []
+            im_selected = np.sort(np.array([self.im_numY,self.im_numX]))
+            for p in range(im_selected[0],im_selected[1]+1):
+                row_ = math.floor(p/self.num_im_row)
+                column_ = p%self.num_im_row
+                self.selected_images.append(p)
+                self.rectangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='red',width=self.rectanglewidth,tags = p))
+            
+        self.c.bind("<Shift-Button-1>", shift_click_select)
+        
+        #this function allows you to select multiple non-adjacent images by hold down control + left click
+        def ctrl_click_select(event):
+            evex = self.c.canvasx(event.x)
+            evey = self.c.canvasy(event.y)
+            x_num = math.ceil((evex)/(self.imsize + self.image_distance))-1
+            y_num = math.ceil((evey)/(self.imsize + self.image_distance))
+            self.im_numX = x_num + self.num_im_row*(y_num-1)
+            row_ = math.floor(self.im_numX/self.num_im_row)
+            column_ = self.im_numX%self.num_im_row
+            current_tags = []
+            if self.im_numX in self.selected_images: 
+                deselect = self.selected_images.index(self.im_numX)
+                self.c.delete(self.rectangles[deselect])
+                #mask = np.ones(len(self.selected_images),dtype=bool)
+                self.selected_images.remove(self.im_numX)
+                #self.selected_images = self.selected_images[mask]
+            else:
+                self.rectangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='red',width=self.rectanglewidth,tags = self.im_numX))
+                self.selected_images.append(self.im_numX)
+                
+        self.c.bind("<Control-Button-1>", ctrl_click_select)
+
+        #this function ranks a selected image by rightclicking an image. It will sort all images based on correlation
+        def rank_images(event):
+            self.communication_label.configure(text='Calculating the ranking. Please wait.')
+            self.communication_label['background'] = '#99CCFF'
+            self.communication_label.update_idletasks()
+            evex = self.c.canvasx(event.x)   #x location to determine selected image
+            evey = self.c.canvasy(event.y)   #y location to determine selected image
+            self.bucketDisp = 2
+            x_num = math.ceil((evex)/(self.imsize + self.image_distance))-1 #determine the row
+            y_num = math.ceil((evey)/(self.imsize + self.image_distance))   #determine the column
+            im_num = x_num + self.num_im_row*(y_num-1) #calculate the actual image number using row and column
+            im_tag = self.c.gettags(self.imagex[im_num])    #get the actual image id from imagex (imagex is a list of all currently displayed images)
+            im_tag = int(float(im_tag[0]))
+            self.rank_list = self.cm[:,int(im_tag)] # get all the correlations between the selected image and all the other images
+            temp_list = np.sort(self.rank_list,0)[::-1] #sorts the correlations
+            self.rank_list = np.argsort(self.rank_list,0)[::-1] #sorts the id of all the images based on correlation
+            self.c.xview_moveto(self.origX)  #####
+            self.c.yview_moveto(self.origY) ######
+            self.rank_list = np.asarray(self.rank_list)
+            temp_list = np.asarray(temp_list)
+            temp_list[np.isnan(temp_list)] = -100   #some images have no correlations due to issues with loading and extracting the image features. Ususally means the image file is damaged
+            self.rank_list = self.rank_list[temp_list>-50] # this removes all the broken images
+            self.rank_list = np.append(im_tag,self.rank_list) # this adds the selected (queried) image to the image list to be displayed
+            #self.bucketDisp = 0
+            self.c.delete("all")
+            self.display_images(self.rank_list) #function to display the ranked list of images. By default it displays all images, but may need to be limited for large datasets
+
+            self.communication_label['background'] = '#FFFFFF'
+            self.communication_label.configure(text='Finished calculating. Showing the ranking')
+            plt.close("all")
+
+            
+        self.c.bind("<Button-3>", rank_images)
+        
+        self.num_im_row = math.floor(self.screen_width / (self.imsize + self.image_distance)) #the total number of images that fit from left to right
+        print("WHATTTTT")
+
         if self.nonR.var.get() == 1 and self.bucketDisp is not 1:
             nonrelevants = self.theBuckets['Non-RelevantItems']
             self.ccluster = [vg for vg in self.ccluster if vg not in nonrelevants]
             self.ccluster = np.asarray(pd.DataFrame.from_dict(self.ccluster)).squeeze()
-        if self.inbucket.var.get() == 1 and self.bucketDisp is not 1:
-            self.ccluster = [vg for vg in self.ccluster if vg not in list(chain.from_iterable(self.theBuckets.values()))]
-            self.ccluster = np.asarray(pd.DataFrame.from_dict(self.ccluster)).squeeze()
+        if self.inbucket.var.get() == 1 and self.bucketDisp != 1:
+            selected = self.categories.curselection()
+            if len(selected) == 0:
+                #self.ccluster = [vg for vg in self.ccluster if vg not in list(chain.from_iterable(self.theBuckets.values()))]
+                t = list(chain.from_iterable(self.theBuckets.values()))
+                xx = list(self.ccluster)
+                self.ccluster = list(sorted(set(self.ccluster) - set(t), key=xx.index))
+                self.ccluster = np.asarray(self.ccluster)
+                
+                
+#                self.ccluster = np.asarray(pd.DataFrame.from_dict(self.ccluster)).squeeze()
+            else:
+#                self.ccluster = [vg for vg in self.ccluster if vg not in self.theBuckets[self.categories.get(selected[0])]]
+                t = list(chain.from_iterable(self.theBuckets.values()))
+                xx = list(self.ccluster)
+                self.ccluster = list(sorted(set(self.ccluster) - set(t), key=xx.index))
+                self.ccluster = np.asarray(self.ccluster)
+#                self.ccluster = np.asarray(pd.DataFrame.from_dict(self.ccluster)).squeeze()
+                
 #        from sys import getsizeof
 #        from collections import OrderedDict, Mapping, Container
 #        def deep_getsizeof(o, ids):
@@ -995,6 +1196,8 @@ class Application(Frame,object):
         num_im =int(self.e1.get())
         if num_im == 0:
             num_im = len(self.im_list)
+        if num_im > 4950:
+            num_im = 4950
         if num_im > len(cluster):
             num_im = len(cluster)
         else:
@@ -1002,28 +1205,64 @@ class Application(Frame,object):
         x = []
         for ij in range(0,len(self.ccluster)):
             x.append(self.im_list[self.ccluster[ij]])
+
         self.imagex = []
         self.c['scrollregion'] = (0,0,0,math.ceil(len(x)/self.num_im_row)*(self.imsize+self.image_distance))
         self.c.delete("all")
         self.greentangles = []
+        self.purpletangles = []
         if self.bucketDisp == 5:
             self.bucketDisp == 0
         if self.preloaded == 1: #if images are preloaded, the images displayed will be selected from self.allimages
-            try: #### this fixes a memory leak by deleting currently loaded images in the memory.
-                for uut in range(0,len(self.my_img)):
-                    self.my_img[uut].destroy()
-            except AttributeError:
-                pass
-            self.my_img = []
 
+#            try: #### this fixes a memory leak by deleting currently loaded images in the memory.
+#                len(self.my_img)
+#                for uut in range(0,len(self.my_img)):
+#                    self.my_img[uut].destroy()
+#            except AttributeError:
+#                pass
+            self.my_img = []
+            
             for j in range(0,len(x)):
 #                self.my_img = Label(self,background='#555555')#, image=render)
-#                self.my_img.image = self.allimages[self.ccluster[j]]
-                render = self.loaded_imgs[j]
+#                self.my_img.image = self.allimages[self.ccluster[j]]                
+                render = ImageTk.PhotoImage(self.loaded_imgs[self.ccluster[j]])
                 self.my_img.append([])
-                self.my_img[j] = ttk.Label(background='#555555')   ####### CAUSES MEMORY LEAK
-                self.my_img[j].image = render                       ####### CAUSES MEMORY LEAK, destroying it does not seem to work.
-
+                self.my_img[j] = ttk.Label(background='#555555')   
+                self.my_img[j].image = render                        
+                
+                #image_.append(my_img)
+                row_ = math.floor(j/self.num_im_row) #determines the row row the image should be displayed on
+                column_ = j%self.num_im_row #determines the column the image should be displayed in
+                #image_[j].grid(row = row_, column = column_)
+                #self.imagex.append(self.c.create_image(column_*(self.imsize + self.image_distance)+ (self.imsize / 2),row_*(self.imsize + self.image_distance)+ (self.imsize / 2), image =self.allimages[self.ccluster[j]], tags =self.ccluster[j])) #displays the image, and adds it to imagex, the list with currently displayed images
+                self.imagex.append(self.c.create_image(column_*(self.imsize + self.image_distance)+ (self.imsize / 2),row_*(self.imsize + self.image_distance)+ (self.imsize / 2), image = render, tags =self.ccluster[j])) #displays the image, and adds it to imagex, the list with currently displayed images
+                
+                if self.bucketDisp is not 1:
+                    if int(self.ccluster[j]) in [xx for vv in self.theBuckets.values() for xx in vv]: #checks if an image is already in the buckets. If so, a cyan square will be drawn around it.
+                        self.greentangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='cyan2',width=self.rectanglewidth,tags = self.ccluster[j]))
+                if self.subcyes == 1:
+                    if int(self.ccluster[j]) in self.sel_im:
+                        self.purpletangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='blueviolet',width=self.rectanglewidth,tags = self.ccluster[j]))
+        
+        if self.preloaded == 3:
+#            try: #### this fixes a memory leak by deleting currently loaded images in the memory.
+#                for uut in range(0,len(self.my_img)):
+#                    self.my_img[uut].destroy()
+#            except AttributeError:
+#                print('watnuweer')
+            self.my_img = []
+            load = Image.open(self.loaded_imgs)
+            for j in range(0,len(x)):
+                im_getx = self.ccluster[j]%650*100
+                im_gety = math.floor(self.ccluster[j]/650)*100
+                
+                ximg = load.crop((im_getx,im_gety,im_getx+100,imget_y+100))
+                render = ImageTk.PhotoImage(ximg)
+                self.my_img.append([])
+                self.my_img[j] = ttk.Label(background='#555555')   
+                self.my_img[j].image = render                        
+                
                 #image_.append(my_img)
                 row_ = math.floor(j/self.num_im_row) #determines the row row the image should be displayed on
                 column_ = j%self.num_im_row #determines the column the image should be displayed in
@@ -1032,7 +1271,49 @@ class Application(Frame,object):
                 self.imagex.append(self.c.create_image(column_*(self.imsize + self.image_distance)+ (self.imsize / 2),row_*(self.imsize + self.image_distance)+ (self.imsize / 2), image = render, tags =self.ccluster[j])) #displays the image, and adds it to imagex, the list with currently displayed images
                 if self.bucketDisp is not 1:
                     if int(self.ccluster[j]) in [xx for vv in self.theBuckets.values() for xx in vv]: #checks if an image is already in the buckets. If so, a cyan square will be drawn around it.
-                          self.greentangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='cyan2',width=self.rectanglewidth,tags = self.ccluster[j]))
+                        self.greentangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='cyan2',width=self.rectanglewidth,tags = self.ccluster[j]))
+                if self.subcyes == 1:
+                    if int(self.ccluster[j]) in self.sel_im:
+                        self.purpletangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='blueviolet',width=self.rectanglewidth,tags = self.ccluster[j]))
+            
+        if self.preloaded == 4:
+            self.my_img = []
+            
+            for j in range(0,4900):
+                self.communication_label.configure(text='Processing image '+ str(j) + ' of ' + str(len(self.im_list)))
+                #                    self.communication_label['background'] = '#99CCFF'
+                self.communication_label.update()
+                
+                
+                
+                load = Image.open(self.im_list[j])
+                try:
+                    for orientation in ExifTags.TAGS.keys():
+                        if ExifTags.TAGS[orientation]=='Orientation':
+                            break
+                    exif=dict(load._getexif().items())
+                
+                    if exif[orientation] == 3:
+                        load=load.rotate(180, expand=True)
+                    elif exif[orientation] == 6:
+                        load=load.rotate(270, expand=True)
+                    elif exif[orientation] == 8:
+                        load=load.rotate(90, expand=True)
+                except AttributeError:
+                    pass
+                except KeyError:
+                    pass
+                load = load.resize((self.imsize,self.imsize))
+                render = ImageTk.PhotoImage(load)                
+                self.my_img.append([])
+                self.my_img[j] = Label(self.c,background='#555555')
+                self.my_img[j].image = render                      
+                row_ = math.floor(j/self.num_im_row)
+                column_ = j%self.num_im_row
+                self.imagex.append(self.c.create_image(column_*(self.imsize + self.image_distance)+ (self.imsize / 2),row_*(self.imsize + self.image_distance)+ (self.imsize / 2), image = render, tags =j))
+                self.c.update()
+                
+            
         else: #same as above, but for when images are not preloaded
             try: #### this fixes a memory leak by deleting currently loaded images in the memory.
                 for uut in range(0,len(self.my_img)):
@@ -1043,23 +1324,51 @@ class Application(Frame,object):
             
             for j in range(0,len(x)):
                 load = Image.open(x[j])
+                try:
+                    for orientation in ExifTags.TAGS.keys():
+                        if ExifTags.TAGS[orientation]=='Orientation':
+                            break
+                    exif=dict(load._getexif().items())
+                
+                    if exif[orientation] == 3:
+                        load=load.rotate(180, expand=True)
+                    elif exif[orientation] == 6:
+                        load=load.rotate(270, expand=True)
+                    elif exif[orientation] == 8:
+                        load=load.rotate(90, expand=True)
+                except AttributeError:
+                    pass
+                except KeyError:
+                    pass
                 load = load.resize((self.imsize,self.imsize))
-                render = ImageTk.PhotoImage(load)
+                render = ImageTk.PhotoImage(load)                
                 self.my_img.append([])
-                self.my_img[j] = ttk.Label(background='#555555')   ####### CAUSES MEMORY LEAK
-                self.my_img[j].image = render                       ####### CAUSES MEMORY LEAK, destroying it does not seem to work.
-                #image_.append(my_img)
+                self.my_img[j] = Label(self.c,background='#555555')
+                self.my_img[j].image = render                      
                 row_ = math.floor(j/self.num_im_row)
                 column_ = j%self.num_im_row
-                #image_[j].grid(row = row_, column = column_)
                 self.imagex.append(self.c.create_image(column_*(self.imsize + self.image_distance)+ (self.imsize / 2),row_*(self.imsize + self.image_distance)+ (self.imsize / 2), image = render, tags =self.ccluster[j]))
+                self.c.update()
+#                self.my_img[j].destroy()
                 if self.bucketDisp is not 1:
-                    if int(self.ccluster[j]) in [xx for vv in   self.theBuckets.values() for xx in vv]:
-                        self.greentangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='cyan2',width=self.rectanglewidth,tags = self.ccluster[j]))
-                load.close()
-                #print(len(self.my_img.image_names()))
-            
-                
+                    if int(self.ccluster[j]) in [xx for vv in self.theBuckets.values() for xx in vv]:
+                            self.greentangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='cyan2',width=self.rectanglewidth,tags = self.ccluster[j]))                    
+                if self.subcyes == 1:
+                    if int(self.ccluster[j]) in self.sel_im:
+                        self.purpletangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='blueviolet',width=self.rectanglewidth,tags = self.ccluster[j]))
+        self.subcyes = 0    
+
+#        try: #### this fixes a memory leak by deleting currently loaded images in the memory.
+#            self.imagex[0].destroy()
+#            for uut in range(0,len(self.my_img)):
+#                self.my_img[uut].destroy()
+#            for uut in range(0,len(self.greentangles)):
+#                self.greentangles[uut].destroy()
+#            for uut in range(0,len(self.purpletangles)):
+#                self.purpletangles[uut].destroy()
+#        except AttributeError:
+#            pass
+
                 
         
         #print(len(self.my_img.image_names()))
@@ -1083,7 +1392,24 @@ class Application(Frame,object):
         self.loaded_imgs = []
         import time
         for z in range(0,len(self.im_list)):
-            load = Image.open(self.im_list[z])                
+            load = Image.open(self.im_list[z])
+            try:            
+                for orientation in ExifTags.TAGS.keys():
+                    if ExifTags.TAGS[orientation]=='Orientation':
+                        break
+                exif=dict(load._getexif().items())
+            
+                if exif[orientation] == 3:
+                    load=load.rotate(180, expand=True)
+                elif exif[orientation] == 6:
+                    load=load.rotate(270, expand=True)
+                elif exif[orientation] == 8:
+                    load=load.rotate(90, expand=True)                
+            except AttributeError:
+                pass
+            except KeyError:
+                pass
+    
             load = load.resize((self.imsize,self.imsize))
             self.loaded_imgs.append(load)
             
@@ -1096,7 +1422,27 @@ class Application(Frame,object):
             
         self.preloaded = 1
 
+    def preload2(self):
+        img_map = map(Image.open, self.im_list)
         
+        #total_width = 100*len(self.im_list)
+        #total_height = 100
+        new_im = Image.new('RGB',(65000,65000))
+        
+        x_offset = 0
+        y_offset = 0
+        for im in img_map:
+            new_im.paste(im.resize((100,100)),(x_offset,y_offset))
+            while x_offset < 64900:
+                x_offset += 100
+            else:
+                x_offset = 0
+                y_offset += 100
+            
+        self.loaded_imgs = io.BytesIO()
+        new_im.save(self.loaded_imgs,format='png')
+        
+        self.preloaded = 3
         
         
     #function to update the image size if the user changes it
@@ -1135,12 +1481,10 @@ class Application(Frame,object):
 
     #function to focus on a selected image. From here you can draw a square to select a part of an image to compare against all other images                   
     def focus_image(self):
-        print(self.selected_images)
         if len(self.selected_images) == 1:
             self.c['scrollregion'] = (0,0,0,800)
             self.squares = None
             im_tag = self.c.gettags(self.imagex[self.selected_images[0]])
-            print(im_tag)
             self.bucketDisp = 5
             self.c.delete("all")
             self.focused_image = []
@@ -1148,6 +1492,23 @@ class Application(Frame,object):
             self.focused_image.append(d)
             for j in range(0,len(self.focused_image)):
                 load = Image.open(self.focused_image[j])
+                try:
+                    for orientation in ExifTags.TAGS.keys():
+                        if ExifTags.TAGS[orientation]=='Orientation':
+                            break
+                    exif=dict(load._getexif().items())
+                
+                    if exif[orientation] == 3:
+                        load=load.rotate(180, expand=True)
+                    elif exif[orientation] == 6:
+                        load=load.rotate(270, expand=True)
+                    elif exif[orientation] == 8:
+                        load=load.rotate(90, expand=True)                
+                except AttributeError:
+                    pass
+                except KeyError:
+                    pass
+
                 load = load.resize((800,800))
                 render = ImageTk.PhotoImage(load)
             # labels can be text or images
@@ -1188,6 +1549,27 @@ class Application(Frame,object):
             self.communication_label.configure(text='Finished calculating. Showing the ranking')
             plt.close("all")
 
+    def rank_bucket(self):
+        if self.bucketDisp == 1:
+            self.bucketDisp = 0
+            bucket_cm = self.cm[self.current_bucket]
+            bucket_cm2 = bucket_cm.reshape((-1,1))
+            super_index = np.arange(0,len(self.im_list))
+            super_index = np.resize(super_index,len(super_index)*len(self.current_bucket))
+            #super_index = super_index[np.flip(np.argsort(np.nan_to_num(bucket_cm2),0))]
+            super_index = pd.unique(super_index[np.flip(np.argsort(np.nan_to_num(bucket_cm2),0))].squeeze())
+            
+            self.c.xview_moveto(self.origX)  #####
+            self.c.yview_moveto(self.origY) ######
+            self.rank_list = super_index
+            self.c.delete("all")
+            self.display_images(self.rank_list) #function to display the ranked list of images. By default it displays all images, but may need to be limited for large datasets
+
+            self.communication_label['background'] = '#FFFFFF'
+            self.communication_label.configure(text='Finished calculating. Showing the ranking')
+
+
+
     # This function shows a filtered selection of buckets.                   
     def filter_buckets(self):
 #        filter_in = self.categories2.curselection() #acquire the selected buckets to show
@@ -1221,7 +1603,6 @@ class Application(Frame,object):
                 self.cluster_out.append(self.theBuckets[self.categories.get(self.filter_out[i])])
         self.cluster_out = list(chain.from_iterable(self.cluster_out)) 
         self.filtered_bucket = np.setdiff1d(self.cluster_in,self.cluster_out)
-        print(self.filtered_bucket)
         self.imagex = []
         self.c.delete("all")
         self.display_images(self.filtered_bucket)
@@ -1233,6 +1614,23 @@ class Application(Frame,object):
     # This function compares the drawn square to all other images                   
     def query_selection(self):
         load = Image.open(self.focused_image[0])
+        try:
+            for orientation in ExifTags.TAGS.keys():
+                if ExifTags.TAGS[orientation]=='Orientation':
+                    break
+            exif=dict(load._getexif().items())
+        
+            if exif[orientation] == 3:
+                load=load.rotate(180, expand=True)
+            elif exif[orientation] == 6:
+                load=load.rotate(270, expand=True)
+            elif exif[orientation] == 8:
+                load=load.rotate(90, expand=True)                
+        except AttributeError:
+            pass
+        except KeyError:
+            pass
+
         width, height = load.size
         evex1 = min(self.evex1,self.evex2)
         evex2 = max(self.evex1,self.evex2)
@@ -1302,6 +1700,22 @@ class Application(Frame,object):
                         ])
             def get_vector2(image_name,f_size, layer, transform, model, neural_net,evex1,evex2,evey1,evey2):
                 img = Image.open(image_name)
+                try:
+                    for orientation in ExifTags.TAGS.keys():
+                        if ExifTags.TAGS[orientation]=='Orientation':
+                            break
+                    exif=dict(img._getexif().items())
+                
+                    if exif[orientation] == 3:
+                        img=img.rotate(180, expand=True)
+                    elif exif[orientation] == 6:
+                        img=img.rotate(270, expand=True)
+                    elif exif[orientation] == 8:
+                        img=img.rotate(90, expand=True)                
+                except AttributeError:
+                    pass
+                except KeyError:
+                    pass
                 img = img.crop((evex1,evey1,evex2,evey2))
                 
                 if img.mode == 'RGB':
@@ -1359,9 +1773,8 @@ class Application(Frame,object):
             self.progress["maximum"] = len(f)-1
             for i in range(0,len(f)):
                 my_embed.append(get_vector2(f[i],f_size,layer,transform,model,neural_net,evex1,evex2,evey1,evey2))
-            print('hi')    
 
-            features = np.asmatrix(my_embed)
+            features = np.asarray(my_embed)
             return features
 
 
@@ -1401,11 +1814,337 @@ class Application(Frame,object):
         self.bucketDisp = 0
         self.c.delete("all")
         x = []
-        print(self.focus_list)
         for i in range(0,len(self.focus_list)):
             d = self.im_list[self.focus_list[i]]
             x.append(d)
-        print(x)
+        self.display_images(self.focus_list)
+
+    #Clusters the currently displayed images into subclusters per the selected images by the user
+    def subcluster(self):
+        m = len(self.selected_images) #number of images selected (number of subclusters)
+        im_tags = [] 
+        for ts in range(len(self.imagex)):
+            im_tags.append(int(self.c.gettags(self.imagex[ts])[0])) #all images currently displayed
+        im_tags = np.asarray(im_tags)
+        self.sel_im = im_tags[self.selected_images] #id of images currently selected
+        #sel_im = sel_im.to_numpy()
+        cur_cm = self.cm[im_tags] #correlations of images currently selected
+        cur_cm = cur_cm[:,self.sel_im] #correlations of images currently selected
+        cur_cm = np.nan_to_num(cur_cm) #removes nans
+        cur_cmax = np.argmax(cur_cm,1) #determine which selected image correlates higher with each image
+        nco = np.array([],dtype='int') #empty array for subclustered images
+        for kk in range(m): #going through the selected images
+            tb = im_tags[cur_cmax==kk]
+            tc = cur_cm[cur_cmax==kk][:,kk]
+            
+            tb = tb[np.flip(np.argsort(tc))]
+            tb = np.delete(tb,np.intersect1d(tb,self.sel_im,return_indices=True)[1],0)
+            try:
+                #nco= np.hstack([nco,sel_im[kk],self.currentcluster[cur_cmax==kk]])
+                nco= np.hstack([nco,self.sel_im[kk],tb])
+
+            except ValueError:
+                #nco= np.vstack([nco,sel_im[kk],self.currentcluster[cur_cmax==kk]])
+                nco= np.vstack([nco,self.sel_im[kk],tb])
+        self.subcyes = 1
+        self.display_images(nco)
+        
+    def subclusterkmeans(self):
+        m = len(self.selected_images)
+        im_tags = [] 
+        for ts in range(len(self.imagex)):
+            im_tags.append(int(self.c.gettags(self.imagex[ts])[0]))
+        im_tags = np.asarray(im_tags)
+        self.sel_im = im_tags[self.selected_images]
+        
+        
+        def color_features(an_image):
+            an_image = an_image.convert('HSV')    
+            imarray = np.asarray(an_image)
+            imarray = imarray.reshape(imarray.shape[0]*imarray.shape[1],3)
+            reimarray = np.vstack((imarray[:,0]/255*360,imarray[:,1]/255,imarray[:,2]/255)).transpose()
+            reimarray[:,0][reimarray[:,0] < 20] = 0
+            reimarray[:,0][np.where((reimarray[:,0] >= 20) & (reimarray[:,0] <= 40))] = 1
+            reimarray[:,0][np.where((reimarray[:,0] >= 40) & (reimarray[:,0] <= 75))] = 2
+            reimarray[:,0][np.where((reimarray[:,0] >= 75) & (reimarray[:,0] <= 155))] = 3
+            reimarray[:,0][np.where((reimarray[:,0] >= 155) & (reimarray[:,0] <= 190))] = 4
+            reimarray[:,0][np.where((reimarray[:,0] >= 190) & (reimarray[:,0] <= 270))] = 5
+            reimarray[:,0][np.where((reimarray[:,0] >= 270) & (reimarray[:,0] <= 295))] = 6
+            reimarray[:,0][reimarray[:,0] > 295] = 7
+            
+            reimarray[:,1][reimarray[:,1] < 0.2] = 0
+            reimarray[:,1][np.where((reimarray[:,1] >= 0.2) & (reimarray[:,1] <= 0.7))] = 1
+            reimarray[:,1][reimarray[:,1] > 0.7] = 2
+            
+            reimarray[:,2][reimarray[:,2] < 0.2] = 0
+            reimarray[:,2][np.where((reimarray[:,2] >= 0.2) & (reimarray[:,2] <= 0.7))] = 1
+            reimarray[:,2][reimarray[:,2] > 0.7] = 2
+        
+            colorvector = reimarray[:,0] * 9 + reimarray[:,1] * 3 +reimarray[:,2]
+            colorvector = np.histogram(colorvector,76)[0]
+            return colorvector
+        def get_colors(image_name):
+            img = Image.open(image_name)
+            color_feature = color_features(img)
+            return color_feature
+#        my_colors = []
+#        for i in range(len(im_tags)):
+#            my_colors.append(get_colors(self.im_list[im_tags[i]]))
+#        my_colors = np.asarray(my_colors)
+        features = self.features[im_tags]
+#        features = features/np.max(features)
+#        features = np.hstack((features,my_colors))
+#        features = my_colors
+        centers = features[np.isin(im_tags,self.sel_im)]
+        #sel_im = sel_im.to_numpy()
+        ward = KMeans(n_clusters=len(self.sel_im), init=centers, n_init=1).fit(features)
+        test2 = ward.labels_
+#        cluster_ind = []
+#        for i in range(0,len(sel_im)):
+#            cluster_ind.append([])
+#        for k in range(0,len(test2)):
+#            cluster_ind[test2[k]].append(k)
+#        xlength = []
+#        for q in range(0,len(cluster_ind)):
+#            xlength.append(len(cluster_ind[q]))
+#        cluster_indX = np.zeros((max(xlength),len(cluster_ind)))-1        
+#        for r in range(0,len(cluster_ind)):
+#            for s in range(0,len(cluster_ind[r])):
+#                cluster_indX[s,r] = int(cluster_ind[r][s])
+#        cluster_indX = cluster_indX.astype(int)
+        
+
+
+#        cur_cm = self.cm[im_tags]
+#        cur_cm = cur_cm[:,sel_im]
+#        cur_cm = np.nan_to_num(cur_cm)
+#        cur_cmax = np.argmax(cur_cm,1)
+        nco = np.array([],dtype='int')
+        for kk in range(m):
+            tb = im_tags[test2==kk]#.to_numpy()
+            try:
+                #nco= np.hstack([nco,sel_im[kk],self.currentcluster[cur_cmax==kk]])
+                nco= np.hstack([nco,self.sel_im[kk],tb])
+
+            except ValueError:
+                #nco= np.vstack([nco,sel_im[kk],self.currentcluster[cur_cmax==kk]])
+                nco= np.vstack([nco,self.sel_im[kk],tb])
+        self.subcyes = 1
+        self.display_images(nco)
+
+
+    def purtangles(self):
+        self.purpletangles = []
+        self.sel_im
+        self.purpletangles.append(self.c.create_rectangle(column_*(self.imsize + self.image_distance), row_*(self.imsize + self.image_distance), column_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, row_*(self.imsize + self.image_distance)+(self.imsize + self.image_distance)-self.image_distance, outline='cyan2',width=self.rectanglewidth,tags = self.ccluster[j]))
+        
+    def query_external(self):
+        self.external_image = str(filedialog.askopenfilename())
+            
+#        self.external_image = Image.open(self.external_image)
+#        try:
+#            for orientation in ExifTags.TAGS.keys():
+#                if ExifTags.TAGS[orientation]=='Orientation':
+#                    break
+#            exif=dict(self.external_imaged._getexif().items())
+#        
+#            if exif[orientation] == 3:
+#                self.external_image=self.external_image.rotate(180, expand=True)
+#            elif exif[orientation] == 6:
+#                self.external_image=self.external_image.rotate(270, expand=True)
+#            elif exif[orientation] == 8:
+#                self.external_image=self.external_image.rotate(90, expand=True)                
+#        except AttributeError:
+#            pass
+#        except KeyError:
+#            pass
+#        width, height = load.size
+#        evex1 = min(self.evex1,self.evex2)
+#        evex2 = max(self.evex1,self.evex2)
+#        evey1 = min(self.evey1,self.evey2)
+#        evey2 = max(self.evey1,self.evey2)
+#        
+#        evex1 = width / (800 / evex1)
+#        evex2 = width / (800 / evex2)
+#        evey1 = height / (800 / evey1)
+#        evey2 = height / (800 / evey2)
+        
+
+        def feature_extraction3(neural_net, im_list):
+            f = im_list
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            if neural_net == 'inception_v3':
+                f_size = 2048
+                model = models.inception_v3(pretrained='imagenet')
+                layer = model._modules.get('Mixed_7c')
+            elif neural_net == 'resnet152': #2084
+                f_size = 2048
+                model = models.resnet152(pretrained=True)
+                layer = model._modules.get('avgpool')
+            elif neural_net == 'resnet18': #512
+                f_size =512
+                model = models.resnet18(pretrained=True)
+                layer = model._modules.get('avgpool')
+            elif neural_net == 'vgg16': #4096
+                f_size = 4096
+                model = models.vgg16(pretrained=True)
+                model.classifier = model.classifier[:-1]
+                layer   = 'nothing'
+            elif neural_net == 'vgg19': #4096
+                f_size =    4096
+                model = models.vgg19(pretrained=True)
+                model.classifier = model.classifier[:-1]
+                layer = 'nothing'
+            elif neural_net == 'densenet161': #2208
+                f_size =2208
+                model = models.densenet161(pretrained=True)	
+                model = model.features
+            elif neural_net == 'squeezenet1_0': #512
+                f_size = 1000
+                model = models.squeezenet1_0(pretrained=True)
+                #model = model.features
+                layer = 'nothing'
+            elif neural_net == 'alexnet':    
+                f_size = 4096
+                model = models.alexnet(pretrained=True)
+                model.classifier = model.classifier[:-1]
+                layer = 'nothing'
+            model.eval()
+            model = model.to(device)
+            mean=[0.485, 0.456, 0.406]
+            std=[0.229, 0.224, 0.225]
+            if neural_net == 'inception_v3':
+                transform = transforms.Compose([
+                            transforms.Resize((299,299)),
+                            transforms.ToTensor(),
+                            transforms.Normalize(mean, std)
+                        ])
+            else:
+                transform = transforms.Compose([
+                            transforms.Resize((224,224)),
+                            transforms.ToTensor(),
+                            transforms.Normalize(mean, std)
+                        ])
+            def get_vector3(image_name,f_size, layer, transform, model, neural_net):
+                img = Image.open(image_name)
+                try:
+                    for orientation in ExifTags.TAGS.keys():
+                        if ExifTags.TAGS[orientation]=='Orientation':
+                            break
+                    exif=dict(img._getexif().items())
+                
+                    if exif[orientation] == 3:
+                        img=img.rotate(180, expand=True)
+                    elif exif[orientation] == 6:
+                        img=img.rotate(270, expand=True)
+                    elif exif[orientation] == 8:
+                        img=img.rotate(90, expand=True)                
+                except AttributeError:
+                    pass
+                except KeyError:
+                    pass
+
+                #img = img.crop((evex1,evey1,evex2,evey2))
+                
+                if img.mode == 'RGB':
+                    try:
+                        t_img = transform(img).unsqueeze(0)
+                    except OSError:
+                        t_img = transform(img).unsqueeze(0)
+                    t_img = t_img.to(device)
+                    if neural_net == 'alexnet' or neural_net =='vgg19' or neural_net =='vgg16' or neural_net =='alexnet' or neural_net =='squeezenet1_0':
+                        torch.cuda.empty_cache()
+                        my_embeddingz = model(t_img)
+                        my_embeddingz = my_embeddingz.cpu()
+                        my_embeddingz = np.ndarray.flatten(my_embeddingz.data.numpy())
+                    elif neural_net == 'densenet161':
+                        featuresY = model(t_img)
+                        my_embeddingz = F.relu(featuresY,inplace= True)
+                        my_embeddingz = F.avg_pool2d(my_embeddingz, kernel_size=7, stride=1).view(featuresY.size(0), -1)
+                        my_embeddingz = my_embeddingz.cpu()
+                        my_embeddingz = np.ndarray.flatten(my_embeddingz.data.numpy())
+                    elif neural_net == 'inception_v3':
+                        my_embeddingz = torch.zeros((1,f_size,8,8))
+                        my_embeddingz = my_embeddingz.to(device)
+                            # 4. Define a function that will copy the output of a layer
+                        def copy_data(m, i, o):
+                            my_embeddingz.copy_(o.data)
+                            # 5. Attach that function to our selected layer
+                        h = layer.register_forward_hook(copy_data)
+                            # 6. Run the model on our transformed image
+                        model(t_img)
+                        #    # 7. Detach our copy function from the layer
+                        h.remove()
+                        my_embeddingz = F.avg_pool2d(my_embeddingz, kernel_size=8)
+                        my_embeddingz = my_embeddingz.view(my_embeddingz.size(0), -1)
+                        my_embeddingz = my_embeddingz.cpu()
+                        my_embeddingz = np.ndarray.flatten(my_embeddingz.data.numpy())
+                    else:
+                        my_embeddingz = torch.zeros((1,f_size,1,1))
+                        my_embeddingz = my_embeddingz.to(device)
+                            # 4. Define a function that will copy the output of a layer
+                        def copy_data(m, i, o):
+                            my_embeddingz.copy_(o.data)
+                            # 5. Attach that function to our selected layer
+                        h = layer.register_forward_hook(copy_data)
+                            # 6. Run the model on our transformed image
+                        model(t_img)
+                        #    # 7. Detach our copy function from the layer
+                        h.remove()
+                        my_embeddingz = my_embeddingz.cpu()
+                        my_embeddingz = np.ndarray.flatten(my_embeddingz.data.numpy())
+                else:
+                    my_embeddingz = np.zeros((f_size,))
+                return my_embeddingz
+            my_embed = []
+            self.progress["value"] = 0
+            self.progress["maximum"] = len(f)-1
+            
+            my_embed.append(get_vector3(f,f_size,layer,transform,model,neural_net))
+
+            features = np.asarray(my_embed)
+            return features
+
+
+        self.externalfeatures = feature_extraction3(self.neuralnet,self.external_image)
+
+        def create_matrix3(focusfeatures,features,distance_metric):
+            focusfeatures = np.squeeze(np.expand_dims(focusfeatures,0))
+            features = np.squeeze(np.expand_dims(features,0))
+            features_t = np.transpose(features)
+            focusfeatures_t = np.transpose(focusfeatures)
+            cm = []                
+            sumX = sum(features_t)
+            focussumX = sum(focusfeatures_t)
+            sumsquareX = sum(features_t**2)
+            
+#                for i in range(0,features.shape[0]):
+            feat0 = focusfeatures
+            sumXY = np.dot(feat0,features_t)
+            r = features.shape[1]*sumXY - focussumX*sumX 
+            s = ((features.shape[1] * sumsquareX) - sumX**2)
+            t = 1./((s[0]*s)**0.5)
+            u = r * t
+            cm.append(u)
+            cm = np.asmatrix(cm)
+            return cm
+        self.focuscm = create_matrix3(self.externalfeatures,self.features,'correlation')
+        temp_list = np.sort(self.focuscm.transpose(),0)[::-1]
+        
+        self.focus_list = np.argsort(self.focuscm.transpose(),0)[::-1]
+        #self.rank_list = self.rank_list[0:1000]
+        self.c.xview_moveto(self.origX)  #####
+        self.c.yview_moveto(self.origY) ######
+        self.focus_list = np.asarray(self.focus_list)
+        temp_list = np.asarray(temp_list)
+        temp_list[np.isnan(temp_list)] = -100
+        self.focus_list = self.focus_list[temp_list>-50]
+        self.bucketDisp = 0
+        self.c.delete("all")
+        x = []
+        for i in range(0,len(self.focus_list)):
+            d = self.im_list[self.focus_list[i]]
+            x.append(d)
         self.display_images(self.focus_list)
 
 
@@ -1486,8 +2225,9 @@ class Application(Frame,object):
             self.current_bucket = self.cluster
             num_im = len(self.cluster)
             self.communication_label.configure(text='The following buckets are shown: '+ bucket_com +'. These buckets contain a total of ' + str(num_im) + ' images.')
+            
         self.imagex = []
-        
+        self.cluster = np.asarray(self.cluster)
         self.display_images(self.cluster)
 
     # function to add the currently displayed cluster to the selected bucket(s)
@@ -1547,6 +2287,7 @@ class Application(Frame,object):
             boxscrollbar.place(in_=self.categories,relx=1.0, relheight=1)
             self.categories.select_set(self.catList.index(self.e2.get()))
             self.categories.see(self.catList.index(self.e2.get()))
+            self.categories.bind('<Button-1>', self.deselect_list )
     #function to display the next bucket
     def nextCluster(self):
         if self.num_clus < self.df.shape[1]-1:
@@ -1566,20 +2307,21 @@ class Application(Frame,object):
             self.communication_label.configure(text='You are currently viewing cluster ' + str(self.num_clus+1) +' out of ' + str(self.df.shape[1]) + ' clusters')
             self.new_threshold = self.threshold
 
+    def showCluster(self):
+        self.num_clus = int(self.ecluster.get())-1
+        self.c.xview_moveto(self.origX)
+        self.c.yview_moveto(self.origY)
+        self.communication_label.configure(text='You are currently viewing cluster ' + str(self.num_clus+1) +' out of ' + str(self.df.shape[1]) + ' clusters')
+        self.new_threshold = self.threshold
         
 
     def change_name(self):
         new_bucket = self.e2.get()
         old_bucket = self.categories.curselection()
-        print(len(old_bucket))
-        print(old_bucket)
         if len(old_bucket) == 1:
             old_bucket = self.catList[old_bucket[0]]
-            print(old_bucket)
-            print(self.catList)
             self.catList = list(self.catList)
             self.catList[self.catList.index(old_bucket)] = new_bucket
-            print(self.catList)
             self.theBuckets[new_bucket] = self.theBuckets.pop(old_bucket)
             self.catList = sorted(self.catList, key=str.lower)
             boxscrollbar = Scrollbar(width = 10)
@@ -1592,7 +2334,7 @@ class Application(Frame,object):
             boxscrollbar.place(in_=self.categories,relx=1.0, relheight=1)
             self.categories.select_set(self.catList.index(self.e2.get()))
             self.categories.see(self.catList.index(self.e2.get()))
-            
+            self.categories.bind('<Button-1>', self.deselect_list )
         
     #function to display the images of the current cluster, e.g. to switch from the bucket view back to the current cluster.
     def showImg(self):
@@ -1616,14 +2358,19 @@ class Application(Frame,object):
         self.answer = filedialog.asksaveasfilename(defaultextension=".pickle")   #this will make the file path a string
             
         pickle_out = open(self.answer,"wb")
-        pickle.dump([self.im_list,self.df,self.catList,self.theBuckets,self.num_clus,self.cm,self.features,self.loaded_imgs],pickle_out)
+        pickle.dump([self.im_list,self.df,self.catList,self.theBuckets,self.num_clus,self.cm,self.features,self.loaded_imgs,self.X_embed],pickle_out,protocol=pickle.HIGHEST_PROTOCOL)
         pickle_out.close()
         self.communication_label.configure(text='Saved!')        
     #function to load a previous session. 
     def load_as(self):
         self.answer2 = filedialog.askopenfilename(defaultextension=".pickle")   #this will make the file path a string
-        pickle_in = open(self.answer2,"rb")
-        self.im_list,self.df,self.catList,self.theBuckets,self.num_clus, self.cm, self.features, self.loaded_imgs= pickle.load(pickle_in)
+        try:
+            pickle_in = open(self.answer2,"rb")        
+            self.im_list,self.df,self.catList,self.theBuckets,self.num_clus, self.cm, self.features, self.loaded_imgs, self.X_embed = pickle.load(pickle_in) #new version with TSNE
+        except ValueError:
+                pickle_in = open(self.answer2,"rb")        
+                self.im_list,self.df,self.catList,self.theBuckets,self.num_clus, self.cm, self.features, self.loaded_imgs = pickle.load(pickle_in) #load old version without TSNE
+            
         pickle_in.close()
         if len(self.loaded_imgs) > 0:
             self.preloaded = 1
@@ -1637,6 +2384,7 @@ class Application(Frame,object):
             self.categories.insert(END,self.catList[k])
         boxscrollbar.config(command=self.categories.yview)
         boxscrollbar.place(in_=self.categories,relx=1.0, relheight=1)
+        self.categories.bind('<Button-1>', self.deselect_list )
         if len(self.im_list) > 0:
             if len(self.cm) > 0:
                 if len(self.df) > 0:
@@ -1656,7 +2404,6 @@ class Application(Frame,object):
         self.answer = filedialog.askdirectory()   #this will make the file directory a string
         for p in range(0,len(self.catList)):
             bucket = self.theBuckets[self.catList[p]]
-            print(bucket)
             if len(bucket) > 0:
                 bucket_dir = self.answer + '/' + self.catList[p]
                 if not os.path.exists(bucket_dir):
@@ -1850,7 +2597,25 @@ class Application(Frame,object):
                             transforms.Normalize(mean, std)
                         ])
             def get_vector(image_name,f_size, layer, transform, model, neural_net):
-                img = Image.open(image_name)
+                img = Image.open(image_name)                
+#                try:
+#                    for orientation in ExifTags.TAGS.keys():
+#                        if ExifTags.TAGS[orientation]=='Orientation':
+#                            break
+#                    exif=dict(img._getexif().items())
+#                    print(image_name)
+#                    if exif[orientation] == 3:
+#                        print(image_name)
+#                        img=img.rotate(180, expand=True)
+#                    elif exif[orientation] == 6:
+#                        img=img.rotate(270, expand=True)
+#                    elif exif[orientation] == 8:
+#                        img=img.rotate(90, expand=True)                
+#                except AttributeError:
+#                    pass
+#                except KeyError:
+#                    pass
+
                 if img.mode == 'RGB':
                     try:
                         t_img = transform(img).unsqueeze(0)
@@ -1934,7 +2699,7 @@ class Application(Frame,object):
                 features = np.squeeze(np.expand_dims(features,0))
                 features_t = np.transpose(features)
                 cm = []
-                sumX = sum(features_t)  
+                sumX = sum(features_t)
                 sumsquareX = sum(features_t**2)
                 for i in range(0,features.shape[0]):
                     feat0 = features[i]
@@ -2232,6 +2997,141 @@ class Application(Frame,object):
         if num_im > len(cluster):
             num_im = len(cluster)
         self.display_images(cluster)
+    #function to create and display a TSNE graph, where the user can select which points to view as images
+    def create_tsne(self):
+        self.tsne_squares = None
+        #function to allow the user to select points in the TSNE graph by drawing a square
+        def tsne_click(event):
+            self.tsneclick = self.tsneclick + 1
+            if self.tsneclick == 2:
+                self.evex_tsne2 = self.canvas_tsne.canvasx(event.x)
+                self.evey_tsne2 = self.canvas_tsne.canvasy(event.y)
+                self.tsneclick = 0
+                if self.tsne_squares is not None:
+                    self.canvas_tsne.delete(self.tsne_squares)
+                self.tsne_squares = self.canvas_tsne.create_rectangle(self.evex_tsne1, self.evey_tsne1, self.evex_tsne2, self.evey_tsne2)                    
+#                print(self.evex_tsne1)
+#                print(self.evex_tsne2)
+#                print(self.evey_tsne1)
+#                print(self.evey_tsne2)
+                xmin = (self.evex_tsne1-1)/(self.screen_width/2)
+                xmax = (self.evex_tsne2-1)/(self.screen_width/2) 
+                ymin = 1 - ((self.evey_tsne1-1)/(self.screen_height))
+                ymax = 1 - ((self.evey_tsne2-1)/(self.screen_height))
+#                print(xmin)
+#                print(xmax)
+#                print(ymin)
+#                print(ymax)
+#                print('hh')
+#                print(self.screen_height)
+#                print(self.screen_width)
+                #sloppy implementation of offsetting the user's selection...:
+#                xmin = (xmin -0.065) * (1/(0.94-0.065))
+#                xmax = (xmax -0.065) * (1/(0.94-0.065))
+#                ymin = (ymin - 0.115) * (1/(0.94-0.115))
+#                ymax = (ymax - 0.115) * (1/(0.94-0.115))
+                X_images = np.where((self.X_embed[:,0] > np.min((xmin,xmax))) & (self.X_embed[:,0] < np.max((xmin,xmax))) & (self.X_embed[:,1] > np.min((ymin,ymax))) & (self.X_embed[:,1] < np.max((ymin,ymax))))
+
+
+#                X_images = self.X_embed[self.X_embed[:,0] < np.max((xmin,xmax))]
+#                X_images = X_images[X_images[:,0] > np.min((xmin,xmax))]
+#                X_images = X_images[X_images[:,1] < np.max((ymin,ymax))]
+#                X_images = X_images[X_images[:,1] > np.min((ymin,ymax))]
+
+                
+                self.display_images(X_images[0])
+            else:
+                self.evex_tsne1 = self.canvas_tsne.canvasx(event.x)
+                self.evey_tsne1 = self.canvas_tsne.canvasy(event.y)
+            
+        if len(self.X_embed) < 1: #get TSNE embedding and normalize it.
+            self.X_embed = TSNE().fit_transform(self.features)
+            self.X_embed[:,0] = self.X_embed[:,0] + abs(np.min(self.X_embed[:,0]))
+            self.X_embed[:,1] = self.X_embed[:,1] + abs(np.min(self.X_embed[:,1]))
+            self.X_embed[:,0] = self.X_embed[:,0]/np.max(self.X_embed[:,0])
+            self.X_embed[:,1] = self.X_embed[:,1]/np.max(self.X_embed[:,1])
+
+        try:
+            self.canvas.delete("all")
+        except AttributeError:
+            pass
+
+        plt.ioff()
+        mpl.rcParams['savefig.pad_inches'] = 0
+#        self.X_embed = [0,0.1,0.2,0.3,0.4,0.98,1]
+#        self.X_embed = np.vstack((self.X_embed,self.X_embed)).transpose()
+        self.canvas_tsne = Canvas(self.newWindow,bg='#555544',bd=0,highlightthickness=0, width = self.screen_width/2+1, height =self.screen_height+1) #canvas size
+        self.canvas_tsne.place(x = self.screen_width/2, y=100)
+        self.tsne = plt.figure(figsize=(self.screen_width/100/2,self.screen_height/100), dpi=100,facecolor='#555555' )
+
+        self.tsne_plot = self.tsne.add_axes([0,0,1,1], facecolor='#FFFFFF',frameon=False)
+        in_bucket = []
+        not_in_bucket = []
+        for jt in range(0,len(self.im_list)):
+            if jt in [xx for vv in self.theBuckets.values() for xx in vv]:
+                in_bucket.append(jt)
+            else:
+                not_in_bucket.append(jt)
+
+
+
+
+        
+            
+        self.tsne_plot.scatter(self.X_embed[not_in_bucket,0],self.X_embed[ not_in_bucket,1],c='black')
+        self.tsne_plot.scatter(self.X_embed[in_bucket,0],self.X_embed[in_bucket,1],c='#00EEEE')
+        try:
+            elected_buckets = self.filter_in
+
+            color_bucket = []
+            for i in range(0,len(elected_buckets)):
+                color_bucket.append(self.theBuckets[self.categories.get(elected_buckets[i])])
+
+            color_bucket = list(chain.from_iterable(color_bucket))
+            if len(color_bucket) > 0:
+                self.tsne_plot.scatter(self.X_embed[color_bucket,0],self.X_embed[color_bucket,1],c='red')
+                
+        except AttributeError:
+            pass
+
+        
+        #self.tsne_plot.set_xlabel('TSNE graph, make a selection!',color='#FFFFFF')
+        self.tsne_plot.tick_params(axis='x', colors='#FFFFFF')
+        self.tsne_plot.tick_params(axis='y', colors='#FFFFFF')
+        self.tsne_plot.spines['bottom'].set_color('#FFFFFF')
+        self.tsne_plot.spines['top'].set_color('#FFFFFF') 
+        self.tsne_plot.spines['right'].set_color('#FFFFFF')
+        self.tsne_plot.spines['left'].set_color('#FFFFFF')
+        #self.tsne_plot.axes.get_xaxis().set_visible(False)
+        self.tsne_plot.axes.get_yaxis().set_visible(False)
+        self.tsne_plot.axes.get_xaxis().set_ticks([])
+        self.tsne_plot.axis([0,1.001,0,1.001])
+        #self.canvas_tsne = Canvas(self.newWindow,bg='#666666',bd=0, width = self.screen_width/2, height =self.screen_height/2-200) #canvas size
+        self.buftsne = io.BytesIO()
+
+        self.tsne.savefig(self.buftsne, format='png', bbox_inches='tight', dpi=100,facecolor='#FFFFFF')
+
+        load_tsne = Image.open(self.buftsne)
+#        load_sankey = load_sankey.resize((self.screen_width-600,self.screen_height+300))
+        render_tsne = ImageTk.PhotoImage(load_tsne)
+        my_img = ttk.Label(self,background='#555555')
+        my_img.image = render_tsne
+        #image_.append(my_img)
+#        self.canvas_tsne.create_image(int((self.screen_width-500)/2),int((self.screen_height+300)/2),image = render_tsne)
+        self.canvas_tsne.create_image(load_tsne.size[0]/2,load_tsne.size[1]/2,image = render_tsne)
+
+        
+        #self.f.tight_layout()
+#        self.canvas_tsne2 = FigureCanvasTkAgg(self.tsne, master=self.canvas_tsne)
+##        self.gcanvas.show()
+#        self.canvas_tsne2.get_tk_widget().pack(side=BOTTOM, fill=BOTH, expand=1)
+        self.canvas_tsne.bind("<Button-1>", tsne_click)
+
+        
+        
+        
+        
+        #self.canvas.create_image(int((self.screen_width-500)/2),int((self.screen_height+300)/2),image = render_sankey)
     
     def create_sankey(self):
         def sankey2(left, right, leftWeight=None, rightWeight=None, colorDict=None,
@@ -2419,8 +3319,11 @@ class Application(Frame,object):
                         )
             plt.gca().axis('off')
             plt.gcf().set_size_inches(6, 6)
+            self.bufsankey = io.BytesIO()
             if figureName != None:
-                plt.savefig("{}.png".format(figureName), bbox_inches='tight', dpi=150,facecolor='#555555')
+#                plt.savefig("{}.png".format(figureName), bbox_inches='tight', dpi=150,facecolor='#555555')
+                plt.savefig(self.bufsankey, format='png', bbox_inches='tight', dpi=150,facecolor='#555555')
+
             plt.close()
 
         #this uses the def sankey2 to create sankey
@@ -2460,7 +3363,8 @@ class Application(Frame,object):
         self.frame.place(x=0,y=0)
         self.canvas = Canvas(self.newWindow,bg='#555555',bd=0, width =self.screen_width-500, height =self.screen_height+400) #canvas size
         self.canvas.place(x = 600, y=0)
-        load_sankey = Image.open('temp_for_sankey.png')
+#        load_sankey = Image.open('temp_for_sankey.png')
+        load_sankey = Image.open(self.bufsankey)
         load_sankey = load_sankey.resize((self.screen_width-600,self.screen_height+300))
         render_sankey = ImageTk.PhotoImage(load_sankey)
         my_img = ttk.Label(self,background='#555555')
